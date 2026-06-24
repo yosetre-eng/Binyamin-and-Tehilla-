@@ -178,9 +178,10 @@ auth.onAuthStateChanged((user) => {
 /* ============================================================
    4) Auth UI handlers
    ============================================================ */
-function showAuthError(msg) {
+function showAuthError(msg, rawCode) {
   const el = document.getElementById("auth-error");
-  el.textContent = msg; el.classList.remove("hidden");
+  el.textContent = msg + (rawCode ? ` [${rawCode}]` : "");
+  el.classList.remove("hidden");
 }
 function clearAuthError() {
   document.getElementById("auth-error").classList.add("hidden");
@@ -209,7 +210,7 @@ document.getElementById("login-form").addEventListener("submit", (e) => {
   const password = document.getElementById("login-password").value;
   auth.signInWithEmailAndPassword(email, password).catch((err) => {
     setAuthLoading(false);
-    showAuthError(authErrorMessage(err.code));
+    showAuthError(authErrorMessage(err.code), err.code);
   });
 });
 
@@ -240,7 +241,7 @@ document.getElementById("register-form").addEventListener("submit", (e) => {
     return userDoc.collection("meta").doc("config").set(defaultCfg);
   }).catch((err) => {
     setAuthLoading(false);
-    showAuthError(authErrorMessage(err.code));
+    showAuthError(authErrorMessage(err.code), err.code);
   });
 });
 
