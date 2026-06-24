@@ -1,24 +1,93 @@
 /* ============================================================
-   1) הגדרות Firebase
-   ⚠️ יש להחליף את הערכים למטה בפרטי פרויקט Firebase חדש ונפרד
-   (ראו הוראות ההקמה שצורפו לקובץ הזה)
+   1) Firebase init
    ============================================================ */
 const firebaseConfig = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
-  projectId: "YOUR_PROJECT_ID",
-  storageBucket: "YOUR_PROJECT_ID.firebasestorage.app",
-  messagingSenderId: "YOUR_SENDER_ID",
-  appId: "YOUR_APP_ID"
+  apiKey: "AIzaSyCG1-bpYRaxCbicwXQe2cHuswYGd3EHChw",
+  authDomain: "expenses-treisman.firebaseapp.com",
+  projectId: "expenses-treisman",
+  storageBucket: "expenses-treisman.firebasestorage.app",
+  messagingSenderId: "177078353973",
+  appId: "1:177078353973:web:9adcb16bc67b5105c3b17c"
 };
-
 firebase.initializeApp(firebaseConfig);
 const db = firebase.firestore();
-const expensesRef = db.collection("expenses");
-const incomeRef = db.collection("income");
-const debtsRef = db.collection("debts");
-const recurringRef = db.collection("recurringExpenses");
-const configRef = db.collection("meta").doc("config");
+const auth = firebase.auth();
+
+// Firestore refs — set per-user after login
+let expensesRef, incomeRef, debtsRef, recurringRef, eventsRef, configRef;
+let firestoreUnsubscribers = [];
+
+function initFirestoreRefs(uid) {
+  const userDoc = db.collection("users").doc(uid);
+  expensesRef = userDoc.collection("expenses");
+  incomeRef   = userDoc.collection("income");
+  debtsRef    = userDoc.collection("debts");
+  recurringRef = userDoc.collection("recurringExpenses");
+  eventsRef   = userDoc.collection("events");
+  configRef   = userDoc.collection("meta").doc("config");
+}
+
+function startFirestoreListeners() {
+  firestoreUnsubscribers.forEach((fn) => fn());
+  firestoreUnsubscribers = [];
+  firestoreUnsubscribers.push(
+    expensesRef.orderBy("date", "desc").onSnapshot((s) => {
+      allExpenses = s.docs.map((d) => ({ id: d.id, ...d.data() }));
+      renderCurrentView();
+    }, (e) => console.error("expenses:", e))
+  );
+  firestoreUnsubscribers.push(
+    incomeRef.orderBy("date", "desc").onSnapshot((s) => {
+      allIncome = s.docs.map((d) => ({ id: d.id, ...d.data() }));
+      renderCurrentView();
+    }, (e) => console.error("income:", e))
+  );
+  firestoreUnsubscribers.push(
+    debtsRef.orderBy("date", "desc").onSnapshot((s) => {
+      allDebts = s.docs.map((d) => ({ id: d.id, ...d.data() }));
+      renderCurrentView();
+    }, (e) => console.error("debts:", e))
+  );
+  firestoreUnsubscribers.push(
+    recurringRef.onSnapshot((s) => {
+      allRecurring = s.docs.map((d) => ({ id: d.id, ...d.data() }));
+      if (!recurringCatchUpRan) { recurringCatchUpRan = true; runRecurringCatchUp(); }
+      renderCurrentView();
+    }, (e) => console.error("recurring:", e))
+  );
+  firestoreUnsubscribers.push(
+    eventsRef.orderBy("createdAt", "desc").onSnapshot((s) => {
+      allEvents = s.docs.map((d) => ({ id: d.id, ...d.data() }));
+      renderCurrentView();
+    }, (e) => console.error("events:", e))
+  );
+  firestoreUnsubscribers.push(
+    configRef.onSnapshot((doc) => {
+      if (!doc.exists) { configRef.set(config); return; }
+      const data = doc.data();
+      config = {
+        categories: data.categories?.length ? data.categories : DEFAULT_CATEGORIES,
+        incomeCategories: data.incomeCategories?.length ? data.incomeCategories : DEFAULT_INCOME_CATEGORIES,
+        budgets: data.budgets || {},
+        accountBalances: data.accountBalances || {},
+        savingsGoals: data.savingsGoals || [],
+        maaserEnabled: data.maaserEnabled || false,
+        isSelfEmployed: data.isSelfEmployed || false,
+        partner1Name: data.partner1Name || "בן/בת זוג 1",
+        partner2Name: data.partner2Name || "בן/בת זוג 2"
+      };
+      updatePartnerNamesInUI();
+      populateCategorySelects();
+      applyMaaserSettings();
+      renderCurrentView();
+    }, (e) => console.error("config:", e))
+  );
+}
+
+function stopFirestoreListeners() {
+  firestoreUnsubscribers.forEach((fn) => fn());
+  firestoreUnsubscribers = [];
+}
 
 /* ============================================================
    2) State
@@ -27,6 +96,7 @@ let allExpenses = [];
 let allIncome = [];
 let allDebts = [];
 let allRecurring = [];
+let allEvents = [];
 let recurringCatchUpRan = false;
 let currentMonth = new Date();
 currentMonth.setDate(1);
@@ -34,71 +104,171 @@ currentMonth.setHours(0, 0, 0, 0);
 let currentView = "dashboard";
 let modalType = "expense";
 let reportType = "expenses";
+let reportPeriod = "month";
 let recurringModalType = "expense";
+let currentEventId = null;
 
 const DEFAULT_CATEGORIES = ["אוכל", "דיור", "תחבורה", "בילויים", "בריאות", "אחר"];
 const DEFAULT_INCOME_CATEGORIES = ["משכורת", "בונוס", "מתנה", "החזר כספי", "אחר"];
-const ACCOUNTS = ["בנימין", "תהילה", "מזומן"];
-const BALANCE_ACCOUNTS = ["בנימין", "תהילה", "מזומן", "חיסכון"];
-const PALETTE = ["#2F8F86", "#D6577A", "#2F5FD6", "#C2570E", "#7C5CE0", "#B8860B", "#34A853", "#EC4899", "#0EA5E9", "#F97316", "#9333EA", "#059669"];
+let ACCOUNTS = ["בן/בת זוג 1", "בן/בת זוג 2", "מזומן"];
+let BALANCE_ACCOUNTS = ["בן/בת זוג 1", "בן/בת זוג 2", "מזומן", "חיסכון"];
+const PALETTE = ["#2F8F86","#D6577A","#2F5FD6","#C2570E","#7C5CE0","#B8860B","#34A853","#EC4899","#0EA5E9","#F97316","#9333EA","#059669"];
 
 let config = {
   categories: DEFAULT_CATEGORIES,
   incomeCategories: DEFAULT_INCOME_CATEGORIES,
   budgets: {},
-  accountBalances: { "בנימין": 0, "תהילה": 0, "מזומן": 0 },
-  savingsGoals: []
+  accountBalances: {},
+  savingsGoals: [],
+  maaserEnabled: false,
+  isSelfEmployed: false,
+  partner1Name: "בן/בת זוג 1",
+  partner2Name: "בן/בת זוג 2"
 };
 
 const HEBREW_MONTHS = ["ינואר","פברואר","מרץ","אפריל","מאי","יוני","יולי","אוגוסט","ספטמבר","אוקטובר","נובמבר","דצמבר"];
 const HEBREW_MONTHS_SHORT = ["ינו","פבר","מרץ","אפר","מאי","יונ","יול","אוג","ספט","אוק","נוב","דצמ"];
 
+// Partner name helpers
+function p1() { return config.partner1Name || "בן/בת זוג 1"; }
+function p2() { return config.partner2Name || "בן/בת זוג 2"; }
+
+function updatePartnerNamesInUI() {
+  const n1 = p1(), n2 = p2();
+  ACCOUNTS = [n1, n2, "מזומן"];
+  BALANCE_ACCOUNTS = [n1, n2, "מזומן", "חיסכון"];
+
+  // Avatars & brand
+  const a1 = document.getElementById("avatar-p1"); if (a1) a1.textContent = n1[0];
+  const a2 = document.getElementById("avatar-p2"); if (a2) a2.textContent = n2[0];
+  const sub = document.getElementById("brand-sub"); if (sub) sub.textContent = `${n1} ו${n2}`;
+  const fhs = document.getElementById("finances-hero-sub");
+  if (fhs) fhs.textContent = `${n1} + ${n2} + מזומן + חיסכון, הכל ביחד`;
+
+  // Stat labels
+  const sl1 = document.getElementById("stat-label-p1"); if (sl1) sl1.textContent = `שילם/ה ${n1}`;
+  const sl2 = document.getElementById("stat-label-p2"); if (sl2) sl2.textContent = `שילם/ה ${n2}`;
+
+  // All partner1 radios & labels
+  document.querySelectorAll('[data-partner="1"]').forEach((el) => { el.value = n1; });
+  document.querySelectorAll('[data-partner-label="1"]').forEach((el) => { el.textContent = n1; });
+  document.querySelectorAll('[data-partner="2"]').forEach((el) => { el.value = n2; });
+  document.querySelectorAll('[data-partner-label="2"]').forEach((el) => { el.textContent = n2; });
+}
+
 /* ============================================================
-   3) Firestore listeners
+   3) Auth state — drives everything
    ============================================================ */
-expensesRef.orderBy("date", "desc").onSnapshot((snapshot) => {
-  allExpenses = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-  renderCurrentView();
-}, (err) => console.error("Firestore error (expenses):", err));
-
-incomeRef.orderBy("date", "desc").onSnapshot((snapshot) => {
-  allIncome = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-  renderCurrentView();
-}, (err) => console.error("Firestore error (income):", err));
-
-debtsRef.orderBy("date", "desc").onSnapshot((snapshot) => {
-  allDebts = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-  renderCurrentView();
-}, (err) => console.error("Firestore error (debts):", err));
-
-recurringRef.onSnapshot((snapshot) => {
-  allRecurring = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-  if (!recurringCatchUpRan) {
-    recurringCatchUpRan = true;
-    runRecurringCatchUp();
+auth.onAuthStateChanged((user) => {
+  if (user) {
+    document.getElementById("auth-overlay").classList.add("hidden");
+    document.getElementById("app").classList.remove("app-hidden");
+    initFirestoreRefs(user.uid);
+    startFirestoreListeners();
+    const emailEl = document.getElementById("settings-user-email");
+    if (emailEl) emailEl.textContent = user.email;
+  } else {
+    stopFirestoreListeners();
+    allExpenses = []; allIncome = []; allDebts = []; allRecurring = []; allEvents = [];
+    document.getElementById("auth-overlay").classList.remove("hidden");
+    document.getElementById("app").classList.add("app-hidden");
   }
-  renderCurrentView();
-}, (err) => console.error("Firestore error (recurring):", err));
-
-configRef.onSnapshot((doc) => {
-  if (!doc.exists) {
-    configRef.set(config);
-    return;
-  }
-  const data = doc.data();
-  config = {
-    categories: data.categories && data.categories.length ? data.categories : DEFAULT_CATEGORIES,
-    incomeCategories: data.incomeCategories && data.incomeCategories.length ? data.incomeCategories : DEFAULT_INCOME_CATEGORIES,
-    budgets: data.budgets || {},
-    accountBalances: data.accountBalances || { "בנימין": 0, "תהילה": 0, "מזומן": 0 },
-    savingsGoals: data.savingsGoals || []
-  };
-  populateCategorySelects();
-  renderCurrentView();
 });
 
 /* ============================================================
-   4) Navigation
+   4) Auth UI handlers
+   ============================================================ */
+function showAuthError(msg) {
+  const el = document.getElementById("auth-error");
+  el.textContent = msg; el.classList.remove("hidden");
+}
+function clearAuthError() {
+  document.getElementById("auth-error").classList.add("hidden");
+}
+function setAuthLoading(on) {
+  document.getElementById("auth-loading").classList.toggle("hidden", !on);
+}
+
+// Tab switch
+document.querySelectorAll("[data-auth-tab]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const tab = btn.dataset.authTab;
+    document.querySelectorAll("[data-auth-tab]").forEach((b) => b.classList.toggle("active", b.dataset.authTab === tab));
+    document.getElementById("login-form").classList.toggle("hidden", tab !== "login");
+    document.getElementById("register-form").classList.toggle("hidden", tab !== "register");
+    clearAuthError();
+  });
+});
+
+// Login
+document.getElementById("login-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  clearAuthError();
+  setAuthLoading(true);
+  const email = document.getElementById("login-email").value.trim();
+  const password = document.getElementById("login-password").value;
+  auth.signInWithEmailAndPassword(email, password).catch((err) => {
+    setAuthLoading(false);
+    showAuthError(authErrorMessage(err.code));
+  });
+});
+
+// Register
+document.getElementById("register-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  clearAuthError();
+  const p1Name = document.getElementById("reg-partner1").value.trim();
+  const p2Name = document.getElementById("reg-partner2").value.trim();
+  const email = document.getElementById("reg-email").value.trim();
+  const password = document.getElementById("reg-password").value;
+  if (!p1Name || !p2Name) { showAuthError("נא להזין שמות לשני בני הזוג"); return; }
+  setAuthLoading(true);
+  auth.createUserWithEmailAndPassword(email, password).then((cred) => {
+    const uid = cred.user.uid;
+    const userDoc = db.collection("users").doc(uid);
+    const defaultCfg = {
+      partner1Name: p1Name,
+      partner2Name: p2Name,
+      categories: DEFAULT_CATEGORIES,
+      incomeCategories: DEFAULT_INCOME_CATEGORIES,
+      budgets: {},
+      accountBalances: { [p1Name]: 0, [p2Name]: 0, "מזומן": 0 },
+      savingsGoals: [],
+      maaserEnabled: false,
+      isSelfEmployed: false
+    };
+    return userDoc.collection("meta").doc("config").set(defaultCfg);
+  }).catch((err) => {
+    setAuthLoading(false);
+    showAuthError(authErrorMessage(err.code));
+  });
+});
+
+// Forgot password
+document.getElementById("forgot-password-btn").addEventListener("click", () => {
+  const email = document.getElementById("login-email").value.trim();
+  if (!email) { showAuthError("הזינו את האימייל כדי לאפס סיסמא"); return; }
+  auth.sendPasswordResetEmail(email).then(() => {
+    clearAuthError();
+    document.getElementById("auth-error").textContent = "📧 נשלח מייל לאיפוס סיסמא";
+    document.getElementById("auth-error").classList.remove("hidden");
+  }).catch(() => showAuthError("לא הצלחנו למצוא את האימייל הזה"));
+});
+
+function authErrorMessage(code) {
+  const map = {
+    "auth/user-not-found": "לא נמצא משתמש עם האימייל הזה",
+    "auth/wrong-password": "סיסמא שגויה",
+    "auth/email-already-in-use": "האימייל הזה כבר רשום — נסו להתחבר",
+    "auth/weak-password": "הסיסמא חלשה מדי — לפחות 6 תווים",
+    "auth/invalid-email": "כתובת אימייל לא תקינה",
+    "auth/invalid-credential": "אימייל או סיסמא שגויים"
+  };
+  return map[code] || "שגיאה — נסו שוב";
+}
+
+/* ============================================================
+   5) Navigation
    ============================================================ */
 const drawerOverlay = document.getElementById("drawer-overlay");
 document.getElementById("open-menu").addEventListener("click", () => drawerOverlay.classList.remove("hidden"));
@@ -127,6 +297,8 @@ function renderCurrentView() {
   else if (currentView === "finances") renderFinancesView();
   else if (currentView === "budget") renderBudgetView();
   else if (currentView === "reports") renderReportsView();
+  else if (currentView === "events") renderEventsView();
+  else if (currentView === "maaser") renderMaaserView();
   else if (currentView === "debts") renderDebtsView();
   else if (currentView === "recurring") renderRecurringView();
   else if (currentView === "settings") renderSettingsView();
@@ -165,6 +337,8 @@ function getMonthList(list, monthDate) {
   end.setMonth(end.getMonth() + 1);
   return list.filter((e) => { const d = toDate(e.date); return d >= start && d < end; });
 }
+function regularExpenses() { return allExpenses.filter((e) => !e.eventId); }
+
 function groupByCategory(list) {
   const map = {};
   list.forEach((e) => { const cat = e.category || "אחר"; map[cat] = (map[cat] || 0) + Number(e.amount || 0); });
@@ -213,13 +387,19 @@ function populateCategorySelects() {
     recurringCategory.innerHTML = list.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("");
     if ([...recurringCategory.options].some((o) => o.value === prev)) recurringCategory.value = prev;
   }
+  const eventExpCat = document.getElementById("event-expense-category");
+  if (eventExpCat) {
+    const prev = eventExpCat.value;
+    eventExpCat.innerHTML = config.categories.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("");
+    if ([...eventExpCat.options].some((o) => o.value === prev)) eventExpCat.value = prev;
+  }
 }
 
 function rowHtml(e, type) {
   const d = toDate(e.date);
   const dateStr = d.toLocaleDateString("he-IL", { day: "numeric", month: "short" });
   const who = type === "income" ? e.account : e.paidBy;
-  const dotClass = who === "בנימין" ? "dot-yosef" : who === "תהילה" ? "dot-agam" : who === "מזומן" ? "dot-cash" : "dot-savings";
+  const dotClass = who === p1() ? "dot-yosef" : who === p2() ? "dot-agam" : who === "מזומן" ? "dot-cash" : "dot-savings";
   const sourceTag = e.source === "telegram" ? " · טלגרם" : e.source === "recurring" ? " · קבוע 🔁" : e.source === "bank-import" ? " · ייבוא בנק 🏦" : "";
   const amountClass = type === "income" ? "row-amount income" : "row-amount";
   const prefix = type === "income" ? "+" : "";
@@ -330,14 +510,14 @@ document.getElementById("income-prev-month").addEventListener("click", () => cha
 document.getElementById("income-next-month").addEventListener("click", () => changeMonth(1));
 
 function renderDashboard() {
-  const monthExpenses = getMonthList(allExpenses, currentMonth);
+  const monthExpenses = getMonthList(regularExpenses(), currentMonth);
   const monthIncome = getMonthList(allIncome, currentMonth);
 
   updateMonthBarLabels();
   document.getElementById("month-sub").textContent = `${monthExpenses.length} הוצאות`;
 
-  const yosefTotal = sumBy(monthExpenses, (e) => e.paidBy === "בנימין");
-  const agamTotal = sumBy(monthExpenses, (e) => e.paidBy === "תהילה");
+  const yosefTotal = sumBy(monthExpenses, (e) => e.paidBy === p1());
+  const agamTotal = sumBy(monthExpenses, (e) => e.paidBy === p2());
   const cashTotal = sumBy(monthExpenses, (e) => e.paidBy === "מזומן");
   const savingsTotal = sumBy(monthExpenses, (e) => e.paidBy === "חיסכון");
   const totalExpenses = sumBy(monthExpenses, () => true);
@@ -351,8 +531,8 @@ function renderDashboard() {
   } else {
     figure.textContent = `${Math.round(totalExpenses).toLocaleString()} ₪`;
     const parts = [];
-    if (yosefTotal > 0) parts.push(`בנימין ${Math.round(yosefTotal).toLocaleString()}₪`);
-    if (agamTotal > 0) parts.push(`תהילה ${Math.round(agamTotal).toLocaleString()}₪`);
+    if (yosefTotal > 0) parts.push(`${p1()} ${Math.round(yosefTotal).toLocaleString()}₪`);
+    if (agamTotal > 0) parts.push(`${p2()} ${Math.round(agamTotal).toLocaleString()}₪`);
     if (cashTotal > 0) parts.push(`מזומן ${Math.round(cashTotal).toLocaleString()}₪`);
     if (savingsTotal > 0) parts.push(`חיסכון ${Math.round(savingsTotal).toLocaleString()}₪`);
     sub.textContent = parts.length ? `מתוכם: ${parts.join(" · ")}` : "סך ההוצאות המשותפות החודש";
@@ -384,7 +564,7 @@ document.getElementById("expenses-show-all").addEventListener("click", () => {
 function renderExpensesView() {
   const term = document.getElementById("search-input").value.trim().toLowerCase();
   const cat = document.getElementById("filter-category").value;
-  const base = expensesShowAll ? allExpenses : getMonthList(allExpenses, currentMonth);
+  const base = expensesShowAll ? regularExpenses() : getMonthList(regularExpenses(), currentMonth);
   const filtered = base.filter((e) => {
     const matchesCat = !cat || e.category === cat;
     const matchesTerm = !term || (e.description || "").toLowerCase().includes(term) || (e.category || "").toLowerCase().includes(term);
@@ -511,7 +691,7 @@ document.getElementById("add-savings-btn").addEventListener("click", () => {
    ============================================================ */
 function renderBudgetView() {
   const thisMonth = new Date(); thisMonth.setDate(1); thisMonth.setHours(0, 0, 0, 0);
-  const spentMap = groupByCategory(getMonthList(allExpenses, thisMonth));
+  const spentMap = groupByCategory(getMonthList(regularExpenses(), thisMonth));
   const cats = config.categories;
   const container = document.getElementById("budget-rows");
   container.innerHTML = cats.map((cat) => {
@@ -650,7 +830,7 @@ document.getElementById("recurring-form").addEventListener("submit", (e) => {
       expensesRef.add({ amount, description: name, category, paidBy: account, source: "recurring", date: now });
     }
     document.getElementById("recurring-form").reset();
-    document.querySelector('input[name="recurringAccount"][value="בנימין"]').checked = true;
+    document.querySelector('input[name="recurringAccount"][data-partner="1"]').checked = true;
     recurringModalOverlay.classList.add("hidden");
   });
 });
@@ -762,84 +942,282 @@ document.querySelectorAll("[data-report]").forEach((btn) => {
   btn.addEventListener("click", () => {
     reportType = btn.dataset.report;
     document.querySelectorAll("[data-report]").forEach((b) => b.classList.toggle("active", b.dataset.report === reportType));
-    document.getElementById("pie-title").textContent = reportType === "income" ? "פילוח הכנסות (מאז ההתחלה)" : "פילוח הוצאות (מאז ההתחלה)";
+    renderReportsView();
+  });
+});
+document.querySelectorAll("[data-period]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    reportPeriod = btn.dataset.period;
+    document.querySelectorAll("[data-period]").forEach((b) => b.classList.toggle("active", b.dataset.period === reportPeriod));
     renderReportsView();
   });
 });
 
+function getReportDateRange() {
+  const now = new Date();
+  if (reportPeriod === "month") {
+    const start = new Date(currentMonth); start.setDate(1); start.setHours(0,0,0,0);
+    const end = new Date(start); end.setMonth(end.getMonth()+1);
+    return { start, end, label: `${HEBREW_MONTHS[currentMonth.getMonth()]} ${currentMonth.getFullYear()}` };
+  }
+  if (reportPeriod === "quarter") {
+    const q = Math.floor(now.getMonth() / 3);
+    const start = new Date(now.getFullYear(), q * 3, 1);
+    const end = new Date(now.getFullYear(), q * 3 + 3, 1);
+    return { start, end, label: `רבעון ${q+1} / ${now.getFullYear()}` };
+  }
+  if (reportPeriod === "year") {
+    const start = new Date(now.getFullYear(), 0, 1);
+    const end = new Date(now.getFullYear()+1, 0, 1);
+    return { start, end, label: `שנת ${now.getFullYear()}` };
+  }
+  return { start: null, end: null, label: "כל הזמנים" };
+}
+
+function filterByRange(list, { start, end }) {
+  if (!start) return list;
+  return list.filter((e) => { const d = toDate(e.date); return d >= start && d < end; });
+}
+
 function renderReportsView() {
-  renderInsights();
-  if (reportType === "income") {
-    renderPieChart(document.getElementById("report-pie-wrap"), groupByCategory(allIncome), { emptyText: "אין עדיין נתוני הכנסות" });
+  const range = getReportDateRange();
+  const regExp = regularExpenses();
+  const periodExp = filterByRange(regExp, range);
+  const periodInc = filterByRange(allIncome, range);
+  const totalExp = sumBy(periodExp, () => true);
+  const totalInc = sumBy(periodInc, () => true);
+  const net = totalInc - totalExp;
+
+  // Net balance hero card
+  const card = document.getElementById("reports-net-card");
+  const isPositive = net >= 0;
+  card.className = `reports-net-card ${isPositive ? "net-positive" : "net-negative"}`;
+  document.getElementById("reports-net-period").textContent = range.label;
+  document.getElementById("reports-net-figure").textContent = `${net >= 0 ? "+" : ""}${Math.round(net).toLocaleString()} ₪`;
+  document.getElementById("reports-net-sub").textContent =
+    `הכנסות ${Math.round(totalInc).toLocaleString()}₪  |  הוצאות ${Math.round(totalExp).toLocaleString()}₪`;
+
+  // Pie chart
+  const pieData = reportType === "income" ? groupByCategory(periodInc) : groupByCategory(periodExp);
+  const pieEmpty = reportType === "income" ? "אין הכנסות בתקופה זו" : "אין הוצאות בתקופה זו";
+  const pieTitle = (reportType === "income" ? "פילוח הכנסות" : "פילוח הוצאות") + ` — ${range.label}`;
+  document.getElementById("pie-title").textContent = pieTitle;
+  renderPieChart(document.getElementById("report-pie-wrap"), pieData, { emptyText: pieEmpty });
+
+  // Category breakdown table
+  const breakdownData = reportType === "income" ? groupByCategory(periodInc) : groupByCategory(periodExp);
+  const breakdownTitle = (reportType === "income" ? "הכנסות" : "הוצאות") + ` לפי קטגוריה — ${range.label}`;
+  document.getElementById("cat-breakdown-title").textContent = breakdownTitle;
+  const sorted = Object.entries(breakdownData).sort((a, b) => b[1] - a[1]);
+  const total = sorted.reduce((s, [,v]) => s + v, 0);
+  const bdEl = document.getElementById("cat-breakdown-list");
+  if (sorted.length === 0) {
+    bdEl.innerHTML = `<p class="empty-hint">אין נתונים לתקופה זו</p>`;
   } else {
-    renderPieChart(document.getElementById("report-pie-wrap"), groupByCategory(allExpenses), { emptyText: "אין עדיין נתוני הוצאות" });
+    bdEl.innerHTML = sorted.map(([cat, amt]) => {
+      const pct = total > 0 ? Math.round((amt / total) * 100) : 0;
+      return `<div class="cat-row-detail">
+        <div class="cat-row-top"><span class="cat-row-name">${escapeHtml(cat)}</span><span class="cat-row-amt">${Math.round(amt).toLocaleString()}₪</span></div>
+        <div class="cat-track"><div class="cat-fill" style="width:${pct}%"></div></div>
+        <span class="cat-row-pct">${pct}%</span>
+      </div>`;
+    }).join("");
   }
 
+  renderInsights();
+
+  // 6-month bar chart
   const months = [];
-  const cursor = new Date(); cursor.setDate(1); cursor.setHours(0, 0, 0, 0);
+  const cursor = new Date(); cursor.setDate(1); cursor.setHours(0,0,0,0);
   for (let i = 5; i >= 0; i--) { const m = new Date(cursor); m.setMonth(m.getMonth() - i); months.push(m); }
-  const expTotals = months.map((m) => sumBy(getMonthList(allExpenses, m), () => true));
+  const expTotals = months.map((m) => sumBy(getMonthList(regExp, m), () => true));
   const incTotals = months.map((m) => sumBy(getMonthList(allIncome, m), () => true));
   const max = Math.max(...expTotals, ...incTotals, 1);
-
   document.getElementById("monthly-chart").innerHTML = months.map((m, i) => `
     <div class="month-bar-col">
       <div class="month-bars-pair">
-        <div class="bar-income" style="height:${(incTotals[i] / max) * 100}%" title="הכנסות: ${Math.round(incTotals[i]).toLocaleString()}₪"></div>
-        <div class="bar-expense" style="height:${(expTotals[i] / max) * 100}%" title="הוצאות: ${Math.round(expTotals[i]).toLocaleString()}₪"></div>
+        <div class="bar-income" style="height:${(incTotals[i]/max)*100}%" title="הכנסות: ${Math.round(incTotals[i]).toLocaleString()}₪"></div>
+        <div class="bar-expense" style="height:${(expTotals[i]/max)*100}%" title="הוצאות: ${Math.round(expTotals[i]).toLocaleString()}₪"></div>
       </div>
       <span class="month-bar-label">${HEBREW_MONTHS_SHORT[m.getMonth()]}</span>
     </div>`).join("");
 }
 
 function renderInsights() {
+  const regExp = regularExpenses();
   const thisMonth = currentMonth;
-  const prevMonth = new Date(thisMonth);
-  prevMonth.setMonth(prevMonth.getMonth() - 1);
-  const thisExp = getMonthList(allExpenses, thisMonth);
-  const prevExp = getMonthList(allExpenses, prevMonth);
+  const prevMonth = new Date(thisMonth); prevMonth.setMonth(prevMonth.getMonth() - 1);
+  const thisExp = getMonthList(regExp, thisMonth);
+  const prevExp = getMonthList(regExp, prevMonth);
   const thisTotal = sumBy(thisExp, () => true);
   const prevTotal = sumBy(prevExp, () => true);
   const delta = thisTotal - prevTotal;
-
   const container = document.getElementById("insights-panel");
   if (thisExp.length === 0 && prevExp.length === 0) {
-    container.innerHTML = `<p class="empty-hint">אין עדיין מספיק נתונים להשוואה</p>`;
-    return;
+    container.innerHTML = `<p class="empty-hint">אין עדיין מספיק נתונים להשוואה</p>`; return;
   }
-
   let summaryHtml = `סך ההוצאות ב${HEBREW_MONTHS[thisMonth.getMonth()]}: <strong>${Math.round(thisTotal).toLocaleString()}₪</strong>`;
   if (prevTotal > 0) {
     const pct = Math.round((delta / prevTotal) * 100);
     if (delta > 0) summaryHtml += ` — עלייה של ${Math.round(delta).toLocaleString()}₪ (${pct}%+) לעומת ${HEBREW_MONTHS[prevMonth.getMonth()]}`;
     else if (delta < 0) summaryHtml += ` — ירידה של ${Math.round(Math.abs(delta)).toLocaleString()}₪ (${Math.abs(pct)}%-) לעומת ${HEBREW_MONTHS[prevMonth.getMonth()]}`;
     else summaryHtml += ` — בדיוק כמו ${HEBREW_MONTHS[prevMonth.getMonth()]}`;
-  } else if (thisTotal > 0) {
-    summaryHtml += ` — אין נתוני השוואה לחודש הקודם`;
-  }
-
-  const thisByCat = groupByCategory(thisExp);
-  const prevByCat = groupByCategory(prevExp);
+  } else if (thisTotal > 0) { summaryHtml += ` — אין נתוני השוואה לחודש הקודם`; }
+  const thisByCat = groupByCategory(thisExp); const prevByCat = groupByCategory(prevExp);
   const allCats = new Set([...Object.keys(thisByCat), ...Object.keys(prevByCat)]);
-  const increases = [...allCats]
-    .map((cat) => ({ cat, diff: (thisByCat[cat] || 0) - (prevByCat[cat] || 0), thisVal: thisByCat[cat] || 0, prevVal: prevByCat[cat] || 0 }))
-    .filter((d) => d.diff > 0)
-    .sort((a, b) => b.diff - a.diff)
-    .slice(0, 4);
-
+  const increases = [...allCats].map((cat) => ({ cat, diff: (thisByCat[cat]||0)-(prevByCat[cat]||0), thisVal: thisByCat[cat]||0, prevVal: prevByCat[cat]||0 })).filter((d) => d.diff > 0).sort((a,b) => b.diff-a.diff).slice(0,4);
   let listHtml = "";
   if (increases.length > 0) {
-    listHtml = `<div class="insight-list">` + increases.map((d) => `
-      <div class="insight-row">
-        <span class="insight-cat">📈 ${escapeHtml(d.cat)}</span>
-        <span class="insight-detail">${Math.round(d.thisVal).toLocaleString()}₪ החודש לעומת ${Math.round(d.prevVal).toLocaleString()}₪ בחודש קודם (+${Math.round(d.diff).toLocaleString()}₪)</span>
-      </div>`).join("") + `</div>`;
+    listHtml = `<div class="insight-list">` + increases.map((d) => `<div class="insight-row"><span class="insight-cat">📈 ${escapeHtml(d.cat)}</span><span class="insight-detail">${Math.round(d.thisVal).toLocaleString()}₪ לעומת ${Math.round(d.prevVal).toLocaleString()}₪ (+${Math.round(d.diff).toLocaleString()}₪)</span></div>`).join("") + `</div>`;
   } else if (thisExp.length > 0) {
     listHtml = `<p class="empty-hint">לא הוצאתם יותר באף קטגוריה לעומת החודש הקודם 🎉</p>`;
   }
-
   container.innerHTML = `<div class="insight-summary">${summaryHtml}</div>${listHtml}`;
 }
+
+/* ============================================================
+   13.7) EVENTS VIEW
+   ============================================================ */
+function renderEventsView() {
+  const active = allEvents.filter((e) => e.active !== false);
+  const closed = allEvents.filter((e) => e.active === false);
+
+  function eventCardHtml(ev) {
+    const evExp = allExpenses.filter((e) => e.eventId === ev.id);
+    const spent = sumBy(evExp, () => true);
+    const budget = ev.budget || 0;
+    const remaining = budget - spent;
+    const pct = budget > 0 ? Math.min(100, Math.round((spent / budget) * 100)) : 0;
+    const over = spent > budget && budget > 0;
+    const icon = ev.icon || "🎯";
+    return `
+      <div class="event-card">
+        <div class="event-card-top">
+          <span class="event-icon">${escapeHtml(icon)}</span>
+          <div class="event-info">
+            <div class="event-name">${escapeHtml(ev.name)}</div>
+            <div class="event-meta">תקציב: ${Math.round(budget).toLocaleString()}₪  ·  הוצאו: ${Math.round(spent).toLocaleString()}₪</div>
+          </div>
+          <span class="event-remaining ${over ? "over" : remaining < 0.2*budget ? "low" : ""}">${over ? "חריגה!" : `נשאר ${Math.round(remaining).toLocaleString()}₪`}</span>
+        </div>
+        <div class="cat-track event-track">
+          <div class="cat-fill ${over ? "over-budget" : ""}" style="width:${pct}%"></div>
+        </div>
+        <div class="event-card-actions">
+          <button class="mini-btn event-add-exp-btn" data-id="${ev.id}" data-name="${escapeHtml(ev.name)}">+ הוצאה</button>
+          <button class="link-btn event-view-exp-btn" data-id="${ev.id}">הוצאות (${evExp.length})</button>
+          ${ev.active !== false
+            ? `<button class="link-btn event-close-btn" data-id="${ev.id}">סגור אירוע</button>`
+            : `<button class="link-btn event-reopen-btn" data-id="${ev.id}">פתח מחדש</button>`}
+          <button class="row-delete event-delete-btn" data-id="${ev.id}">מחק</button>
+        </div>
+        <div class="event-exp-list hidden" id="event-exp-list-${ev.id}">
+          ${evExp.length === 0 ? `<p class="empty-hint">עדיין אין הוצאות לאירוע הזה</p>` :
+            evExp.map((e) => `
+              <div class="expense-row">
+                <span class="row-dot dot-yosef"></span>
+                <div class="row-main">
+                  <div class="row-title">${escapeHtml(e.description || e.category || "הוצאה")}</div>
+                  <div class="row-meta">${escapeHtml(e.category || "אחר")} · ${escapeHtml(e.paidBy || "")} · ${toDate(e.date).toLocaleDateString("he-IL")}</div>
+                </div>
+                <span class="row-amount">${Math.round(e.amount).toLocaleString()}₪</span>
+                <button class="row-delete" data-eid="${e.id}" aria-label="מחק">✕</button>
+              </div>`).join("")}
+        </div>
+      </div>`;
+  }
+
+  const activeEl = document.getElementById("events-list");
+  activeEl.innerHTML = active.length === 0 ? `<p class="empty-hint">עדיין אין אירועים פעילים</p>` : active.map(eventCardHtml).join("");
+
+  const closedEl = document.getElementById("events-closed-list");
+  closedEl.innerHTML = closed.length === 0 ? `<p class="empty-hint">עדיין אין אירועים שהסתיימו</p>` : closed.map(eventCardHtml).join("");
+
+  document.querySelectorAll(".event-add-exp-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      currentEventId = btn.dataset.id;
+      document.getElementById("event-expense-title").textContent = `הוצאה לאירוע: ${btn.dataset.name}`;
+      populateCategorySelects();
+      document.getElementById("event-expense-modal-overlay").classList.remove("hidden");
+    });
+  });
+  document.querySelectorAll(".event-view-exp-btn").forEach((btn) => {
+    const listEl = document.getElementById(`event-exp-list-${btn.dataset.id}`);
+    btn.addEventListener("click", () => listEl.classList.toggle("hidden"));
+  });
+  document.querySelectorAll(".event-close-btn").forEach((btn) => {
+    btn.addEventListener("click", () => eventsRef.doc(btn.dataset.id).update({ active: false }));
+  });
+  document.querySelectorAll(".event-reopen-btn").forEach((btn) => {
+    btn.addEventListener("click", () => eventsRef.doc(btn.dataset.id).update({ active: true }));
+  });
+  document.querySelectorAll(".event-delete-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (!confirm("למחוק את האירוע? ההוצאות שלו ימחקו גם הן.")) return;
+      const evExp = allExpenses.filter((e) => e.eventId === btn.dataset.id);
+      const batch = db.batch();
+      evExp.forEach((e) => batch.delete(expensesRef.doc(e.id)));
+      batch.delete(eventsRef.doc(btn.dataset.id));
+      batch.commit();
+    });
+  });
+  document.querySelectorAll("[data-eid]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (!confirm("למחוק הוצאה זו מהאירוע?")) return;
+      expensesRef.doc(btn.dataset.eid).delete();
+    });
+  });
+}
+
+// New event form
+const eventModalOverlay = document.getElementById("event-modal-overlay");
+document.getElementById("open-add-event").addEventListener("click", () => {
+  document.getElementById("event-form").reset();
+  eventModalOverlay.classList.remove("hidden");
+});
+document.getElementById("close-event-modal").addEventListener("click", () => eventModalOverlay.classList.add("hidden"));
+eventModalOverlay.addEventListener("click", (e) => { if (e.target === eventModalOverlay) eventModalOverlay.classList.add("hidden"); });
+document.getElementById("event-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const name = document.getElementById("event-name").value.trim();
+  const budget = parseFloat(document.getElementById("event-budget").value);
+  const icon = document.getElementById("event-icon").value.trim() || "🎯";
+  if (!name || !budget || budget <= 0) return;
+  eventsRef.add({ name, budget, icon, active: true, createdAt: firebase.firestore.Timestamp.now() }).then(() => {
+    eventModalOverlay.classList.add("hidden");
+    showToast(`האירוע "${name}" נוצר 🎯`);
+  });
+});
+
+// Add expense to event
+const eventExpenseModalOverlay = document.getElementById("event-expense-modal-overlay");
+document.getElementById("close-event-expense-modal").addEventListener("click", () => {
+  eventExpenseModalOverlay.classList.add("hidden");
+  currentEventId = null;
+});
+eventExpenseModalOverlay.addEventListener("click", (e) => {
+  if (e.target === eventExpenseModalOverlay) { eventExpenseModalOverlay.classList.add("hidden"); currentEventId = null; }
+});
+document.getElementById("event-expense-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (!currentEventId) return;
+  const amount = parseFloat(document.getElementById("event-expense-amount").value);
+  const description = document.getElementById("event-expense-desc").value.trim();
+  const category = document.getElementById("event-expense-category").value;
+  const paidBy = document.querySelector('input[name="eventExpenseAccount"]:checked').value;
+  if (!amount || amount <= 0) return;
+  expensesRef.add({
+    amount, description, category, paidBy,
+    eventId: currentEventId, source: "event",
+    date: firebase.firestore.Timestamp.now()
+  }).then(() => {
+    document.getElementById("event-expense-form").reset();
+    document.querySelector('input[name="eventExpenseAccount"][data-partner="1"]').checked = true;
+    eventExpenseModalOverlay.classList.add("hidden");
+    currentEventId = null;
+    showToast("הוצאה נוספה לאירוע ✅");
+  });
+});
 
 /* ============================================================
    13) SETTINGS VIEW
@@ -847,6 +1225,11 @@ function renderInsights() {
 function renderSettingsView() {
   renderCategoryChips(document.getElementById("category-manage-list"), config.categories, "categories");
   renderCategoryChips(document.getElementById("income-category-manage-list"), config.incomeCategories, "incomeCategories");
+  document.getElementById("toggle-maaser").checked = config.maaserEnabled;
+  document.getElementById("toggle-self-employed").checked = config.isSelfEmployed;
+  const user = auth.currentUser;
+  const emailEl = document.getElementById("settings-user-email");
+  if (emailEl && user) emailEl.textContent = `מחוברים בתור: ${user.email} | ${p1()} ו${p2()}`;
 }
 function renderCategoryChips(container, list, field) {
   container.innerHTML = list.map((cat) => `<span class="category-chip">${escapeHtml(cat)}<button data-cat="${escapeHtml(cat)}" aria-label="הסר">✕</button></span>`).join("");
@@ -895,6 +1278,10 @@ function exportCSV() {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+document.getElementById("logout-btn").addEventListener("click", () => {
+  if (!confirm("לצאת מהחשבון?")) return;
+  auth.signOut();
+});
 document.getElementById("clear-all-btn").addEventListener("click", () => {
   if (!confirm("בטוחים? כל ההוצאות וההכנסות יימחקו לצמיתות.")) return;
   if (!confirm("רגע אחרון - זו פעולה שאי אפשר לבטל. למחוק הכל?")) return;
@@ -1152,24 +1539,185 @@ document.getElementById("expense-form").addEventListener("submit", (e) => {
   const account = document.querySelector('input[name="payAccount"]:checked').value;
   if (!amount || amount <= 0) return;
 
+  const balanceBefore = computeAccountBalance(account);
+
   if (modalType === "income") {
-    incomeRef.add({ amount, description, category, account, source: "web", date: firebase.firestore.Timestamp.now() }).then(resetAndClose);
+    incomeRef.add({ amount, description, category, account, source: "web", date: firebase.firestore.Timestamp.now() }).then(() => {
+      if (account === "מזומן") showToast("מס הכנסה בדרך 😅💵");
+      resetAndClose();
+      triggerBalanceFlash(account, balanceBefore, balanceBefore + amount, "income");
+    });
   } else {
     expensesRef.add({ amount, description, category, paidBy: account, source: "web", date: firebase.firestore.Timestamp.now() }).then(() => {
-      if (account === "תהילה") showToast("הופההה האישה שילמה מי היה מאמין 😂");
-      else if (account === "בנימין") showToast("סוף סוף הגבר משלם 😎");
+      if (account === "מזומן") showToast("מס הכנסה בדרך 😅💵");
+      else if (account === p2()) showToast(`הופההה ${p2()} שילמה מי היה מאמין 😂`);
+      else if (account === p1()) showToast(`סוף סוף ${p1()} משלם 😎`);
       resetAndClose();
+      triggerBalanceFlash(account, balanceBefore, balanceBefore - amount, "expense");
     });
   }
 });
+
+function triggerBalanceFlash(account, oldBal, newBal, type) {
+  const icons = { [p1()]: "👤", [p2()]: "👩", "מזומן": "💵", "חיסכון": "💰" };
+  const flashEl = document.getElementById("balance-flash");
+  const amountEl = document.getElementById("balance-flash-amount");
+  const deltaEl = document.getElementById("balance-flash-delta");
+  document.getElementById("balance-flash-icon").textContent = icons[account] || "💳";
+  document.getElementById("balance-flash-label").textContent = account;
+  const diff = newBal - oldBal;
+  deltaEl.textContent = (diff >= 0 ? "+" : "") + Math.round(diff).toLocaleString() + "₪";
+  deltaEl.className = "balance-flash-delta " + (type === "income" ? "delta-up" : "delta-down");
+  flashEl.classList.remove("hidden", "flash-out");
+
+  let startTime = null;
+  const duration = 1400;
+  function animate(ts) {
+    if (!startTime) startTime = ts;
+    const p = Math.min((ts - startTime) / duration, 1);
+    const ease = 1 - Math.pow(1 - p, 3);
+    const current = oldBal + (newBal - oldBal) * ease;
+    amountEl.textContent = Math.round(current).toLocaleString() + " ₪";
+    if (p < 1) requestAnimationFrame(animate);
+    else amountEl.textContent = Math.round(newBal).toLocaleString() + " ₪";
+  }
+  requestAnimationFrame(animate);
+
+  clearTimeout(window._flashTimer);
+  window._flashTimer = setTimeout(() => {
+    flashEl.classList.add("flash-out");
+    setTimeout(() => flashEl.classList.add("hidden"), 400);
+  }, 2600);
+}
+
 function resetAndClose() {
   document.getElementById("expense-form").reset();
-  document.querySelector('input[name="payAccount"][value="בנימין"]').checked = true;
+  document.querySelector('input[name="payAccount"][data-partner="1"]').checked = true;
   overlay.classList.add("hidden");
 }
 
 /* ============================================================
+   13.8) MAASER VIEW
+   ============================================================ */
+function computeMaaserData() {
+  const maaserAccounts = [p1(), p2(), "מזומן"];
+  const totalIncome = sumBy(allIncome, (i) => maaserAccounts.includes(i.account));
+  const owed = totalIncome * 0.1;
+  const paid = sumBy(allExpenses, (e) => e.category === "מעשרות");
+  const remaining = Math.max(0, owed - paid);
+  return { totalIncome, owed, paid, remaining };
+}
+
+function renderMaaserView() {
+  const { totalIncome, owed, paid, remaining } = computeMaaserData();
+  const card = document.getElementById("maaser-hero");
+  card.className = "maaser-hero " + (remaining > 0 ? "maaser-owes" : "maaser-clear");
+  document.getElementById("maaser-owed-fig").textContent = `${Math.round(owed).toLocaleString()} ₪`;
+  document.getElementById("maaser-hero-sub").textContent =
+    remaining > 0 ? `נשאר לשלם ${Math.round(remaining).toLocaleString()}₪` : `✅ המעשרות שולמו במלואם!`;
+  document.getElementById("maaser-total-income").textContent = `${Math.round(totalIncome).toLocaleString()}₪`;
+  document.getElementById("maaser-owed-stat").textContent = `${Math.round(owed).toLocaleString()}₪`;
+  document.getElementById("maaser-paid-total").textContent = `${Math.round(paid).toLocaleString()}₪`;
+  document.getElementById("maaser-remaining").textContent = `${Math.round(remaining).toLocaleString()}₪`;
+  document.getElementById("maaser-calc-explanation").textContent =
+    `חישוב: 10% × ${Math.round(totalIncome).toLocaleString()}₪ הכנסות = ${Math.round(owed).toLocaleString()}₪ חובת מעשרות. שולמו ${Math.round(paid).toLocaleString()}₪ → נותר ${Math.round(remaining).toLocaleString()}₪.`;
+
+  const maaserPayments = allExpenses.filter((e) => e.category === "מעשרות").sort((a,b) => toDate(b.date)-toDate(a.date));
+  const listEl = document.getElementById("maaser-payments-list");
+  if (maaserPayments.length === 0) {
+    listEl.innerHTML = `<p class="empty-hint">עדיין לא שולמו מעשרות</p>`;
+  } else {
+    listEl.innerHTML = maaserPayments.map((e) => {
+      const dateStr = toDate(e.date).toLocaleDateString("he-IL", { day:"numeric", month:"short", year:"numeric" });
+      return `<div class="expense-row">
+        <span class="row-dot" style="background:var(--yosef)"></span>
+        <div class="row-main">
+          <div class="row-title">${escapeHtml(e.description || "תשלום מעשרות")}</div>
+          <div class="row-meta">מעשרות · ${escapeHtml(e.paidBy||"")} · ${dateStr}</div>
+        </div>
+        <span class="row-amount">${Math.round(e.amount).toLocaleString()}₪</span>
+        <button class="row-delete" data-eid="${e.id}">✕</button>
+      </div>`;
+    }).join("");
+    listEl.querySelectorAll(".row-delete").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if (confirm("למחוק תשלום מעשרות זה?")) expensesRef.doc(btn.dataset.eid).delete();
+      });
+    });
+  }
+}
+
+const maaserModalOverlay = document.getElementById("maaser-modal-overlay");
+document.getElementById("open-add-maaser").addEventListener("click", () => {
+  document.getElementById("maaser-form").reset();
+  document.querySelector('input[name="maaserAccount"][data-partner="1"]').checked = true;
+  const { remaining } = computeMaaserData();
+  if (remaining > 0) document.getElementById("maaser-amount").value = Math.round(remaining);
+  maaserModalOverlay.classList.remove("hidden");
+});
+document.getElementById("close-maaser-modal").addEventListener("click", () => maaserModalOverlay.classList.add("hidden"));
+maaserModalOverlay.addEventListener("click", (e) => { if (e.target === maaserModalOverlay) maaserModalOverlay.classList.add("hidden"); });
+document.getElementById("maaser-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const amount = parseFloat(document.getElementById("maaser-amount").value);
+  const org = document.getElementById("maaser-org").value.trim();
+  const account = document.querySelector('input[name="maaserAccount"]:checked').value;
+  if (!amount || amount <= 0) return;
+  const balBefore = computeAccountBalance(account);
+  expensesRef.add({
+    amount, description: org || "מעשרות לצדקה",
+    category: "מעשרות", paidBy: account,
+    source: "maaser", date: firebase.firestore.Timestamp.now()
+  }).then(() => {
+    maaserModalOverlay.classList.add("hidden");
+    showToast("🤲 תשלום מעשרות נרשם — מצוה!");
+    triggerBalanceFlash(account, balBefore, balBefore - amount, "expense");
+  });
+});
+
+/* ============================================================
+   13.9) SETTINGS TOGGLES (maaser + self-employed)
+   ============================================================ */
+function applyMaaserSettings() {
+  const { maaserEnabled, isSelfEmployed } = config;
+
+  // Show/hide maaser drawer item
+  const maaserDrawerItem = document.getElementById("maaser-drawer-item");
+  if (maaserDrawerItem) maaserDrawerItem.classList.toggle("hidden", !maaserEnabled);
+
+  // Sync toggle UI
+  const maaserToggle = document.getElementById("toggle-maaser");
+  if (maaserToggle && maaserToggle.checked !== maaserEnabled) maaserToggle.checked = maaserEnabled;
+  const seToggle = document.getElementById("toggle-self-employed");
+  if (seToggle && seToggle.checked !== isSelfEmployed) seToggle.checked = isSelfEmployed;
+
+  // Manage "מעשרות" category
+  const hasMaaserCat = config.categories.includes("מעשרות");
+  if (maaserEnabled && !hasMaaserCat) {
+    configRef.set({ categories: [...config.categories, "מעשרות"] }, { merge: true });
+  } else if (!maaserEnabled && hasMaaserCat) {
+    configRef.set({ categories: config.categories.filter((c) => c !== "מעשרות") }, { merge: true });
+  }
+
+  // Manage "עסק" category (self-employed only, independent of maaser)
+  const hasBusinessCat = config.categories.includes("עסק");
+  if (isSelfEmployed && !hasBusinessCat) {
+    configRef.set({ categories: [...config.categories, "עסק"] }, { merge: true });
+  } else if (!isSelfEmployed && hasBusinessCat) {
+    configRef.set({ categories: config.categories.filter((c) => c !== "עסק") }, { merge: true });
+  }
+}
+
+document.getElementById("toggle-maaser").addEventListener("change", (e) => {
+  configRef.set({ maaserEnabled: e.target.checked }, { merge: true });
+});
+document.getElementById("toggle-self-employed").addEventListener("change", (e) => {
+  configRef.set({ isSelfEmployed: e.target.checked }, { merge: true });
+});
+
+/* ============================================================
    15) Init
    ============================================================ */
-populateCategorySelects();
-renderCurrentView();
+// Startup is driven by auth.onAuthStateChanged above.
+// Hide app until auth confirmed.
+document.getElementById("app").classList.add("app-hidden");
